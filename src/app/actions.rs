@@ -371,51 +371,128 @@ impl AppState {
         self.navigator_rows_from(&terminal_runtimes)
     }
 
+    fn build_navigator_tree_rows(
+        &self,
+        ws_idx: usize,
+        depth: u8,
+        query_kind: NavigatorQueryKind,
+        query: &str,
+        children_map: &std::collections::HashMap<usize, Vec<usize>>,
+        visited: &mut std::collections::HashSet<usize>,
+        rows: &mut Vec<NavigatorRow>,
+        terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
+    ) {
+        if !visited.insert(ws_idx) {
+            return;
+        }
+
+        let ws = &self.workspaces[ws_idx];
+        let workspace_label = ws.display_name_from(&self.terminals, terminal_runtimes);
+        let activity = workspace_activity_summary(ws, &self.terminals);
+        let workspace_search_text = format!("{workspace_label} {activity}").to_lowercase();
+
+        let workspace_matches = match query_kind {
+            NavigatorQueryKind::Empty => true,
+            NavigatorQueryKind::State(filter) => {
+                let (state, seen) = ws.aggregate_state(&self.terminals);
+                navigator_state_filter_matches(filter, state, seen)
+            }
+            NavigatorQueryKind::Text => navigator_matches(query, &workspace_search_text),
+        };
+
+        let child_rows = self.navigator_child_rows(ws_idx, depth, query_kind, query);
+
+        let mut sub_workspace_rows = Vec::new();
+        if let Some(child_indices) = children_map.get(&ws_idx) {
+            for &child_idx in child_indices {
+                self.build_navigator_tree_rows(
+                    child_idx,
+                    depth + 1,
+                    query_kind,
+                    query,
+                    children_map,
+                    visited,
+                    &mut sub_workspace_rows,
+                    terminal_runtimes,
+                );
+            }
+        }
+
+        if !workspace_matches && child_rows.is_empty() && sub_workspace_rows.is_empty() {
+            return;
+        }
+
+        let expanded = !matches!(query_kind, NavigatorQueryKind::Empty)
+            || self.navigator.expanded_workspaces.contains(&ws.id);
+        let (state, seen) = ws.aggregate_state(&self.terminals);
+        let pane_count = ws.tabs.iter().map(|tab| tab.panes.len()).sum::<usize>();
+
+        rows.push(NavigatorRow {
+            target: NavigatorTarget::Workspace { ws_idx },
+            depth,
+            label: format!("{workspace_label} ({pane_count})"),
+            meta: activity,
+            status: state,
+            seen,
+            is_current: self.active == Some(ws_idx),
+            is_workspace: true,
+            is_tab: false,
+            expanded,
+            search_text: workspace_search_text,
+        });
+
+        if expanded {
+            rows.extend(child_rows);
+            rows.extend(sub_workspace_rows);
+        }
+    }
+
     pub(crate) fn navigator_rows_from(
         &self,
         terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
     ) -> Vec<NavigatorRow> {
         let query = self.navigator.query.trim().to_lowercase();
         let query_kind = navigator_query_kind(&query, self.navigator.state_filter);
-        let mut rows = Vec::new();
-        for (ws_idx, ws) in self.workspaces.iter().enumerate() {
-            let workspace_label = ws.display_name_from(&self.terminals, terminal_runtimes);
-            let activity = workspace_activity_summary(ws, &self.terminals);
-            let workspace_search_text = format!("{workspace_label} {activity}").to_lowercase();
-            let workspace_matches = match query_kind {
-                NavigatorQueryKind::Empty => true,
-                NavigatorQueryKind::State(filter) => {
-                    let (state, seen) = ws.aggregate_state(&self.terminals);
-                    navigator_state_filter_matches(filter, state, seen)
+
+        let mut children_map = std::collections::HashMap::new();
+        let mut roots = Vec::new();
+
+        for (idx, ws) in self.workspaces.iter().enumerate() {
+            let mut parent_idx = None;
+            if let Some(parent_token) = ws.metadata_tokens.values().get("PARENT_WORKSPACE") {
+                for (other_idx, other) in self.workspaces.iter().enumerate() {
+                    if other_idx != idx {
+                        let other_display = other.display_name_from(&self.terminals, terminal_runtimes);
+                        if other_display == *parent_token ||
+                           other.custom_name.as_ref() == Some(parent_token) ||
+                           other.id == *parent_token {
+                            parent_idx = Some(other_idx);
+                            break;
+                        }
+                    }
                 }
-                NavigatorQueryKind::Text => navigator_matches(&query, &workspace_search_text),
-            };
-
-            let child_rows = self.navigator_child_rows(ws_idx, query_kind, &query);
-            if !workspace_matches && child_rows.is_empty() {
-                continue;
             }
 
-            let expanded = !matches!(query_kind, NavigatorQueryKind::Empty)
-                || self.navigator.expanded_workspaces.contains(&ws.id);
-            let (state, seen) = ws.aggregate_state(&self.terminals);
-            let pane_count = ws.tabs.iter().map(|tab| tab.panes.len()).sum::<usize>();
-            rows.push(NavigatorRow {
-                target: NavigatorTarget::Workspace { ws_idx },
-                depth: 0,
-                label: format!("{workspace_label} ({pane_count})"),
-                meta: activity,
-                status: state,
-                seen,
-                is_current: self.active == Some(ws_idx),
-                is_workspace: true,
-                is_tab: false,
-                expanded,
-                search_text: workspace_search_text,
-            });
-            if expanded {
-                rows.extend(child_rows);
+            if let Some(p_idx) = parent_idx {
+                children_map.entry(p_idx).or_insert_with(Vec::new).push(idx);
+            } else {
+                roots.push(idx);
             }
+        }
+
+        let mut rows = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        for &ws_idx in &roots {
+            self.build_navigator_tree_rows(
+                ws_idx,
+                0,
+                query_kind,
+                &query,
+                &children_map,
+                &mut visited,
+                &mut rows,
+                terminal_runtimes,
+            );
         }
         rows
     }
@@ -423,6 +500,7 @@ impl AppState {
     fn navigator_child_rows(
         &self,
         ws_idx: usize,
+        base_depth: u8,
         query_kind: NavigatorQueryKind,
         query: &str,
     ) -> Vec<NavigatorRow> {
@@ -432,7 +510,7 @@ impl AppState {
         let multi_tab = ws.tabs.len() > 1;
         let mut rows = Vec::new();
         for tab_idx in 0..ws.tabs.len() {
-            let tab_row = multi_tab.then(|| self.navigator_tab_row(ws_idx, tab_idx));
+            let tab_row = multi_tab.then(|| self.navigator_tab_row(ws_idx, tab_idx, base_depth));
             let tab_matches = tab_row.as_ref().is_some_and(|row| match query_kind {
                 NavigatorQueryKind::Empty => true,
                 NavigatorQueryKind::State(filter) => {
@@ -440,7 +518,7 @@ impl AppState {
                 }
                 NavigatorQueryKind::Text => navigator_matches(query, &row.search_text),
             });
-            let pane_rows = self.navigator_pane_rows_for_tab(ws_idx, tab_idx, multi_tab);
+            let pane_rows = self.navigator_pane_rows_for_tab(ws_idx, tab_idx, multi_tab, base_depth);
             let filtered_panes = match query_kind {
                 NavigatorQueryKind::Empty => pane_rows,
                 NavigatorQueryKind::State(filter) => pane_rows
@@ -464,7 +542,7 @@ impl AppState {
         rows
     }
 
-    fn navigator_tab_row(&self, ws_idx: usize, tab_idx: usize) -> NavigatorRow {
+    fn navigator_tab_row(&self, ws_idx: usize, tab_idx: usize, base_depth: u8) -> NavigatorRow {
         let ws = &self.workspaces[ws_idx];
         let tab = &ws.tabs[tab_idx];
         let label = ws
@@ -481,7 +559,7 @@ impl AppState {
         let search_text = format!("{label} {meta}").to_lowercase();
         NavigatorRow {
             target: NavigatorTarget::Tab { ws_idx, tab_idx },
-            depth: 1,
+            depth: 1 + base_depth,
             label,
             meta,
             status,
@@ -499,6 +577,7 @@ impl AppState {
         ws_idx: usize,
         tab_idx: usize,
         multi_tab: bool,
+        base_depth: u8,
     ) -> Vec<NavigatorRow> {
         let Some(ws) = self.workspaces.get(ws_idx) else {
             return Vec::new();
@@ -557,7 +636,7 @@ impl AppState {
                     tab_idx,
                     pane_id,
                 },
-                depth: if multi_tab { 2 } else { 1 },
+                depth: (if multi_tab { 2 } else { 1 }) + base_depth,
                 label,
                 meta,
                 status: state,
@@ -571,6 +650,7 @@ impl AppState {
         }
         rows
     }
+
 
     fn current_navigator_row_index_from(
         &self,
@@ -2736,6 +2816,7 @@ impl AppState {
             }
             AppEvent::WorktreeAddFinished(_) => Vec::new(),
             AppEvent::WorktreeRemoveFinished(_) => Vec::new(),
+            AppEvent::WorktreeBranchOutFinished { .. } => Vec::new(),
             AppEvent::PluginCommandFinished { .. } => Vec::new(),
         }
     }
