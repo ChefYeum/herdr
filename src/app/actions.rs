@@ -459,13 +459,23 @@ impl AppState {
 
         for (idx, ws) in self.workspaces.iter().enumerate() {
             let mut parent_idx = None;
-            if let Some(parent_token) = ws.metadata_tokens.values().get("PARENT_WORKSPACE") {
+            let parent_token_opt = ws.metadata_tokens.values().get("PARENT_WORKSPACE").cloned()
+                .or_else(|| {
+                    let parent_file = ws.identity_cwd.join(".parent");
+                    if parent_file.exists() {
+                        std::fs::read_to_string(parent_file).ok().map(|content| format!("Feature: {}", content.trim()))
+                    } else {
+                        None
+                    }
+                });
+
+            if let Some(parent_token) = parent_token_opt {
                 for (other_idx, other) in self.workspaces.iter().enumerate() {
                     if other_idx != idx {
                         let other_display = other.display_name_from(&self.terminals, terminal_runtimes);
-                        if other_display == *parent_token ||
-                           other.custom_name.as_ref() == Some(parent_token) ||
-                           other.id == *parent_token {
+                        if other_display == parent_token ||
+                           other.custom_name.as_ref() == Some(&parent_token) ||
+                           other.id == parent_token {
                             parent_idx = Some(other_idx);
                             break;
                         }

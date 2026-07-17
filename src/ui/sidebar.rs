@@ -330,103 +330,75 @@ pub(crate) fn workspace_list_entries_expanded(app: &AppState) -> Vec<WorkspaceLi
     workspace_list_entries_inner(app, true)
 }
 
-fn workspace_list_entries_inner(app: &AppState, force_expanded: bool) -> Vec<WorkspaceListEntry> {
-    let mut members_by_key = std::collections::HashMap::<String, Vec<usize>>::new();
-    for (ws_idx, ws) in app.workspaces.iter().enumerate() {
-        if let Some(space) = ws.worktree_space() {
-            members_by_key
-                .entry(space.key.clone())
-                .or_default()
-                .push(ws_idx);
+fn workspace_list_entries_inner(app: &AppState, _force_expanded: bool) -> Vec<WorkspaceListEntry> {
+    // 1. Build parent-child mapping using PARENT_WORKSPACE tokens
+    let mut children_map = std::collections::HashMap::new();
+    let mut roots = Vec::new();
+
+    for (idx, ws) in app.workspaces.iter().enumerate() {
+        let mut parent_idx = None;
+        let parent_token_opt = ws.metadata_tokens.values().get("PARENT_WORKSPACE").cloned()
+            .or_else(|| {
+                let parent_file = ws.identity_cwd.join(".parent");
+                if parent_file.exists() {
+                    std::fs::read_to_string(parent_file).ok().map(|content| format!("Feature: {}", content.trim()))
+                } else {
+                    None
+                }
+            });
+
+        if let Some(parent_token) = parent_token_opt {
+            for (other_idx, other) in app.workspaces.iter().enumerate() {
+                if other_idx != idx {
+                    let other_display = other.display_name_from(&app.terminals, &crate::terminal::TerminalRuntimeRegistry::new());
+                    if other_display == parent_token ||
+                       other.custom_name.as_ref() == Some(&parent_token) ||
+                       other.id == parent_token {
+                        parent_idx = Some(other_idx);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(p_idx) = parent_idx {
+            children_map.entry(p_idx).or_insert_with(Vec::new).push(idx);
+        } else {
+            roots.push(idx);
         }
     }
-    let grouped_keys = members_by_key
-        .iter()
-        .filter(|(_, members)| {
-            members.len() >= 2
-                && members.iter().any(|idx| {
-                    app.workspaces
-                        .get(*idx)
-                        .and_then(|ws| ws.worktree_space())
-                        .is_some_and(|space| !space.is_linked_worktree)
-                })
-        })
-        .map(|(key, _)| key.clone())
-        .collect::<std::collections::HashSet<_>>();
 
-    let visible_group_idx = if matches!(app.mode, Mode::Navigate) {
-        Some(app.selected)
-    } else {
-        app.active
-    };
-    let active_group = visible_group_idx.and_then(|idx| {
-        app.workspaces
-            .get(idx)
-            .and_then(|ws| ws.worktree_space())
-            .map(|space| space.key.clone())
-    });
-
-    let mut emitted_groups = std::collections::HashSet::<String>::new();
+    // 2. Build the entries vector recursively!
     let mut entries = Vec::new();
-    for (ws_idx, ws) in app.workspaces.iter().enumerate() {
-        let Some(space) = ws
-            .worktree_space()
-            .filter(|space| grouped_keys.contains(&space.key))
-        else {
-            entries.push(WorkspaceListEntry::Workspace {
-                ws_idx,
-                indented: false,
-            });
-            continue;
-        };
+    let mut visited = std::collections::HashSet::new();
 
-        if !emitted_groups.insert(space.key.clone()) {
-            continue;
+    fn build_sidebar_entries(
+        ws_idx: usize,
+        indented: bool,
+        children_map: &std::collections::HashMap<usize, Vec<usize>>,
+        visited: &mut std::collections::HashSet<usize>,
+        entries: &mut Vec<WorkspaceListEntry>,
+    ) {
+        if !visited.insert(ws_idx) {
+            return;
         }
 
-        let Some(members) = members_by_key.get(&space.key) else {
-            continue;
-        };
-        let Some(parent_idx) = members.iter().copied().find(|idx| {
-            app.workspaces
-                .get(*idx)
-                .and_then(|member| member.worktree_space())
-                .is_some_and(|member_space| !member_space.is_linked_worktree)
-        }) else {
-            entries.push(WorkspaceListEntry::Workspace {
-                ws_idx,
-                indented: false,
-            });
-            continue;
-        };
-        let collapsed = !force_expanded && app.collapsed_space_keys.contains(&space.key);
         entries.push(WorkspaceListEntry::Workspace {
-            ws_idx: parent_idx,
-            indented: false,
+            ws_idx,
+            indented,
         });
 
-        if collapsed {
-            if let Some(active_idx) = visible_group_idx
-                .filter(|idx| *idx != parent_idx)
-                .filter(|_| active_group.as_deref() == Some(space.key.as_str()))
-            {
-                entries.push(WorkspaceListEntry::Workspace {
-                    ws_idx: active_idx,
-                    indented: true,
-                });
-            }
-        } else {
-            for member_idx in members {
-                if *member_idx == parent_idx {
-                    continue;
-                }
-                entries.push(WorkspaceListEntry::Workspace {
-                    ws_idx: *member_idx,
-                    indented: true,
-                });
+        if let Some(child_indices) = children_map.get(&ws_idx) {
+            for &child_idx in child_indices {
+                build_sidebar_entries(child_idx, true, children_map, visited, entries);
             }
         }
     }
+
+    for &ws_idx in &roots {
+        build_sidebar_entries(ws_idx, false, &children_map, &mut visited, &mut entries);
+    }
+
     entries
 }
 
