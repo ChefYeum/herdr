@@ -49,6 +49,14 @@ pub struct WorktreeRemoveParams {
     pub force: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+pub struct WorktreeBranchOutParams {
+    pub parent_workspace_id: String,
+    pub branch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WorktreeSourceInfo {
     pub repo_key: String,

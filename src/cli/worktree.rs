@@ -1,5 +1,6 @@
 use crate::api::schema::{
-    WorktreeCreateParams, WorktreeListParams, WorktreeOpenParams, WorktreeRemoveParams,
+    WorktreeBranchOutParams, WorktreeCreateParams, WorktreeListParams, WorktreeOpenParams,
+    WorktreeRemoveParams,
 };
 
 pub(super) fn run_worktree_command(args: &[String]) -> std::io::Result<i32> {
@@ -13,6 +14,7 @@ pub(super) fn run_worktree_command(args: &[String]) -> std::io::Result<i32> {
         "create" => worktree_create(&args[1..]),
         "open" => worktree_open(&args[1..]),
         "remove" => worktree_remove(&args[1..]),
+        "branch-out" => worktree_branch_out(&args[1..]),
         "help" | "--help" | "-h" => {
             print_worktree_help();
             Ok(0)
@@ -282,6 +284,64 @@ fn worktree_remove(args: &[String]) -> std::io::Result<i32> {
     })
 }
 
+fn worktree_branch_out(args: &[String]) -> std::io::Result<i32> {
+    let mut parent_workspace_id = None;
+    let mut branch = None;
+    let mut label = None;
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--parent" => {
+                if index + 1 < args.len() {
+                    parent_workspace_id = Some(args[index + 1].clone());
+                    index += 2;
+                } else {
+                    eprintln!("missing value for --parent");
+                    return Ok(2);
+                }
+            }
+            "--branch" => {
+                if index + 1 < args.len() {
+                    branch = Some(args[index + 1].clone());
+                    index += 2;
+                } else {
+                    eprintln!("missing value for --branch");
+                    return Ok(2);
+                }
+            }
+            "--label" => {
+                if index + 1 < args.len() {
+                    label = Some(args[index + 1].clone());
+                    index += 2;
+                } else {
+                    eprintln!("missing value for --label");
+                    return Ok(2);
+                }
+            }
+            other => {
+                eprintln!("unknown option: {other}");
+                return Ok(2);
+            }
+        }
+    }
+
+    let Some(parent_workspace_id) = parent_workspace_id else {
+        eprintln!("usage: herdr worktree branch-out --parent ID --branch NAME [--label TEXT]");
+        return Ok(2);
+    };
+    let Some(branch) = branch else {
+        eprintln!("usage: herdr worktree branch-out --parent ID --branch NAME [--label TEXT]");
+        return Ok(2);
+    };
+
+    super::runtime::worktree_branch_out(WorktreeBranchOutParams {
+        parent_workspace_id,
+        branch,
+        label,
+    })
+}
+
 fn print_worktree_help() {
     eprintln!("herdr worktree commands:");
     eprintln!("  herdr worktree list [--workspace ID | --cwd PATH] [--json]");
@@ -292,6 +352,7 @@ fn print_worktree_help() {
         "  herdr worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--json]"
     );
     eprintln!("  herdr worktree remove --workspace ID [--force] [--json]");
+    eprintln!("  herdr worktree branch-out --parent ID --branch NAME [--label TEXT]");
 }
 
 fn normalize_path_arg(value: &str) -> std::io::Result<String> {

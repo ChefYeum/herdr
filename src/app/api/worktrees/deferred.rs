@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api::schema::{
     EventData, EventEnvelope, EventKind, Request, ResponseResult, WorktreeCreateParams,
-    WorktreeRemoveParams,
+    WorktreeRemoveParams, WorktreeBranchOutParams,
 };
 use crate::app::App;
 use crate::events::{ApiWorktreeAddRequest, ApiWorktreeRemoveRequest, AppEvent};
@@ -20,6 +20,10 @@ impl App {
         match request.method {
             crate::api::schema::Method::WorktreeCreate(params) => {
                 self.start_api_worktree_create(request.id, params, respond_to);
+                true
+            }
+            crate::api::schema::Method::WorktreeBranchOut(params) => {
+                self.start_api_worktree_branch_out(request.id, params, respond_to);
                 true
             }
             crate::api::schema::Method::WorktreeRemove(params) => {
@@ -471,6 +475,162 @@ impl App {
         Self::send_api_response(api.respond_to, response);
     }
 
+    pub(crate) fn handle_worktree_branch_out_finished(
+        &mut self,
+        id: String,
+        _operation_id: u64,
+        branch: String,
+        label: Option<String>,
+        respond_to: std::sync::mpsc::Sender<String>,
+        results: Vec<(String, Result<std::path::PathBuf, String>)>,
+    ) {
+        // Clean up pending operation keys
+        for (_, res) in &results {
+            if let Ok(checkout_path) = res {
+                let checkout_key = crate::worktree::canonical_or_original(checkout_path);
+                self.pending_api_worktree_creates.remove(&checkout_key);
+            }
+        }
+
+        // Check if all repositories failed to branch out
+        let errors: Vec<String> = results.iter()
+            .filter_map(|(repo_name, res)| res.as_ref().err().map(|err| format!("[{}] {}", repo_name, err)))
+            .collect();
+        if errors.len() == results.len() {
+            Self::send_api_response(
+                respond_to,
+                encode_error(id, "branch_out_failed", errors.join("; ")),
+            );
+            return;
+        }
+
+        // Define our unified features folder path
+        let features_dir = std::path::PathBuf::from("/home/chefyeum/Documents/features").join(&branch);
+
+        // Find or create a single unified workspace for this feature
+        let ws_idx = if let Some(ws_idx) = self.open_workspace_idx_for_checkout(&features_dir) {
+            if let Some(custom_label) = &label {
+                if let Some(ws) = self.state.workspaces.get_mut(ws_idx) {
+                    ws.set_custom_name(custom_label.clone());
+                }
+            }
+            ws_idx
+        } else {
+            match self.create_workspace_with_options(features_dir.clone(), true) {
+                Ok(ws_idx) => {
+                    if let Some(custom_label) = &label {
+                        if let Some(ws) = self.state.workspaces.get_mut(ws_idx) {
+                            ws.set_custom_name(custom_label.clone());
+                        }
+                    }
+                    ws_idx
+                }
+                Err(err) => {
+                    Self::send_api_response(
+                        respond_to,
+                        encode_error(id, "workspace_open_failed", format!("Failed to create unified workspace: {err}")),
+                    );
+                    return;
+                }
+            }
+        };
+
+        // Switch to/focus the newly created workspace
+        self.state.switch_workspace(ws_idx);
+
+        // Rename the default first tab (Tab 0) to "Home"
+        if let Some(ws) = self.state.workspaces.get_mut(ws_idx) {
+            if let Some(tab) = ws.tabs.get_mut(0) {
+                tab.set_custom_name("Home".to_string());
+            }
+        }
+
+        // Add repository-specific tabs to this workspace
+        let (rows, cols) = self.state.estimate_pane_size();
+        let default_shell = self.state.default_shell.clone();
+        let scrollback_limit_bytes = self.state.pane_scrollback_limit_bytes;
+        let host_terminal_theme = self.state.host_terminal_theme;
+
+        for (repo_name, res) in &results {
+            if let Ok(checkout_path) = res {
+                let create_result = self
+                    .state
+                    .workspaces
+                    .get_mut(ws_idx)
+                    .ok_or_else(|| std::io::Error::other("workspace disappeared"))
+                    .and_then(|ws| {
+                        ws.create_tab(
+                            rows,
+                            cols,
+                            checkout_path.clone(),
+                            scrollback_limit_bytes,
+                            host_terminal_theme,
+                            crate::pane::PaneShellConfig::new(&default_shell, self.state.shell_mode),
+                            Vec::new(),
+                        )
+                    });
+
+                match create_result {
+                    Ok((tab_idx, terminal, runtime)) => {
+                        self.terminal_runtimes.insert(terminal.id.clone(), runtime);
+                        self.state.terminals.insert(terminal.id.clone(), terminal);
+                        self.state.remove_alias_shadowed_by_new_pane(
+                            self.state.workspaces[ws_idx].tabs[tab_idx].root_pane,
+                        );
+                        if let Some(tab) = self
+                            .state
+                            .workspaces
+                            .get_mut(ws_idx)
+                            .and_then(|ws| ws.tabs.get_mut(tab_idx))
+                        {
+                            tab.set_custom_name(repo_name.clone());
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!(repo = %repo_name, error = %err, "failed to create repository tab");
+                    }
+                }
+            }
+        }
+
+        // Focus Tab 1 (usually hanson) so they land right inside code
+        if self.state.workspaces[ws_idx].tabs.len() > 1 {
+            self.state.switch_workspace_tab(ws_idx, 1);
+        }
+
+        self.state.mark_session_dirty();
+        self.render_dirty.store(true, std::sync::atomic::Ordering::Release);
+        self.render_notify.notify_one();
+
+        // Send a single successful JSON response back to the client satisfying CLI contract
+        let tab_idx = self.state.workspaces[ws_idx].active_tab;
+        let worktree = crate::api::schema::worktrees::WorktreeInfo {
+            path: features_dir.display().to_string(),
+            branch: Some(branch.clone()),
+            is_linked_worktree: true,
+            is_detached: false,
+            is_bare: false,
+            is_prunable: false,
+            label: label.clone().unwrap_or_else(|| branch.clone()),
+            open_workspace_id: Some(self.state.workspaces[ws_idx].id.clone()),
+        };
+
+        let response = encode_success(
+            id,
+            ResponseResult::WorktreeCreated {
+                workspace: self.workspace_info(ws_idx),
+                tab: self
+                    .tab_info(ws_idx, tab_idx)
+                    .expect("created unified workspace should have active tab"),
+                root_pane: self
+                    .root_pane_info(ws_idx, tab_idx)
+                    .expect("created unified workspace should have active root pane"),
+                worktree,
+            },
+        );
+        Self::send_api_response(respond_to, response);
+    }
+
     pub(crate) fn handle_api_worktree_remove_finished(
         &mut self,
         mut result: crate::events::WorktreeRemoveResult,
@@ -600,5 +760,134 @@ impl App {
             },
         );
         Self::send_api_response(api.respond_to, response);
+    }
+
+    fn start_api_worktree_branch_out(
+        &mut self,
+        id: String,
+        params: WorktreeBranchOutParams,
+        respond_to: std::sync::mpsc::Sender<String>,
+    ) {
+        let parent_ws_id = params.parent_workspace_id.clone();
+        let branch = params.branch.trim().to_string();
+        if branch.is_empty() {
+            Self::send_api_response(
+                respond_to,
+                encode_error(id, "invalid_request", "branch is required"),
+            );
+            return;
+        }
+
+        // Find parent workspace
+        let parent_ws = self.state.workspaces.iter().find(|ws| ws.id == parent_ws_id);
+        if parent_ws.is_none() {
+            Self::send_api_response(
+                respond_to,
+                encode_error(id, "workspace_not_found", "parent workspace not found"),
+            );
+            return;
+        }
+        let parent_ws = parent_ws.unwrap();
+        let parent_branch = parent_ws.cached_git_branch.clone().unwrap_or_else(|| "HEAD".into());
+
+        // Find all base workspaces (the repositories we want to branch out in)
+        let base_workspaces: Vec<(String, std::path::PathBuf)> = self.state.workspaces.iter()
+            .filter(|ws| {
+                let path = &ws.identity_cwd;
+                let is_base_repo = path.ends_with("hanson")
+                    || path.ends_with("smarkets")
+                    || path.ends_with("pricing_config");
+                is_base_repo && ws.id != "wM"
+            })
+            .map(|ws| (ws.id.clone(), ws.identity_cwd.clone()))
+            .collect();
+
+        if base_workspaces.is_empty() {
+            Self::send_api_response(
+                respond_to,
+                encode_error(id, "invalid_request", "no base repositories found to branch out"),
+            );
+            return;
+        }
+
+        let operation_id = self.next_api_worktree_operation_id();
+
+        // Register each repository's checkout key in pending_api_worktree_creates
+        for (_, identity_cwd) in &base_workspaces {
+            let repo_root = identity_cwd;
+            let repo_name = repo_root.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("repo")
+                .to_string();
+            let parent_dir = repo_root.parent().unwrap();
+            let checkout_dir_name = format!("{}.worktrees", repo_name);
+            let checkout_path = parent_dir.join(checkout_dir_name).join(&branch);
+            let checkout_key = crate::worktree::canonical_or_original(&checkout_path);
+
+            self.pending_api_worktree_creates.insert(checkout_key, operation_id);
+        }
+
+        let event_tx = self.event_tx.clone();
+        let label = params.label.clone();
+        let branch_clone = branch.clone();
+
+        // Spawn a background thread to orchestrate parallel branch creation
+        std::thread::spawn(move || {
+            let mut results = Vec::new();
+
+            for (_ws_id, identity_cwd) in &base_workspaces {
+                let repo_root = identity_cwd;
+                let repo_name = repo_root.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("repo")
+                    .to_string();
+
+                let parent_dir = repo_root.parent().unwrap();
+                let checkout_dir_name = format!("{}.worktrees", repo_name);
+                let checkout_path = parent_dir.join(checkout_dir_name).join(&branch_clone);
+
+                // Create parent directories
+                if let Some(parent) = checkout_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+
+                // Execute standard git worktree add
+                let result = crate::worktree::run_worktree_add_command(
+                    repo_root,
+                    &checkout_path,
+                    &branch_clone,
+                    &parent_branch,
+                );
+
+                match result {
+                    Ok(()) => {
+                        #[cfg(unix)]
+                        {
+                            let features_dir = parent_dir.join("features").join(&branch_clone);
+                            if std::fs::create_dir_all(&features_dir).is_ok() {
+                                let symlink_path = features_dir.join(&repo_name);
+                                let _ = std::fs::remove_file(&symlink_path);
+                                let _ = std::os::unix::fs::symlink(&checkout_path, &symlink_path);
+                            }
+                        }
+
+                        results.push((repo_name, Ok(checkout_path)));
+                    }
+                    Err(err) => {
+                        results.push((repo_name, Err(err)));
+                    }
+                }
+            }
+
+            // Send unified completion event back to main event loop
+            let _ = event_tx.blocking_send(AppEvent::WorktreeBranchOutFinished {
+                id,
+                operation_id,
+                branch: branch_clone,
+                label,
+                respond_to,
+                results,
+            });
+        });
     }
 }

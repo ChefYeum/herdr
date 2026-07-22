@@ -156,4 +156,13 @@ pub enum AppEvent {
     WorktreeAddFinished(Box<WorktreeAddResult>),
     /// Background `git worktree remove` completed.
     WorktreeRemoveFinished(Box<WorktreeRemoveResult>),
+    /// Background `git worktree branch-out` completed.
+    WorktreeBranchOutFinished {
+        id: String,
+        operation_id: u64,
+        branch: String,
+        label: Option<String>,
+        respond_to: std::sync::mpsc::Sender<String>,
+        results: Vec<(String, Result<std::path::PathBuf, String>)>,
+    },
 }

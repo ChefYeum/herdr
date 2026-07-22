@@ -470,11 +470,15 @@ impl AppState {
                 });
 
             if let Some(parent_token) = parent_token_opt {
+                let clean_parent = parent_token.strip_prefix("Feature: ").unwrap_or(&parent_token).trim();
                 for (other_idx, other) in self.workspaces.iter().enumerate() {
                     if other_idx != idx {
                         let other_display = other.display_name_from(&self.terminals, terminal_runtimes);
-                        if other_display == parent_token ||
-                           other.custom_name.as_ref() == Some(&parent_token) ||
+                        let clean_other = other_display.strip_prefix("Feature: ").unwrap_or(&other_display).trim();
+                        let clean_custom = other.custom_name.as_ref().map(|s| s.strip_prefix("Feature: ").unwrap_or(s).trim());
+                        
+                        if clean_other == clean_parent ||
+                           clean_custom == Some(clean_parent) ||
                            other.id == parent_token {
                             parent_idx = Some(other_idx);
                             break;

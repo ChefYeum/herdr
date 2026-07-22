@@ -150,6 +150,11 @@ impl App {
             return;
         }
 
+        if let AppEvent::WorktreeBranchOutFinished { id, operation_id, branch, label, respond_to, results } = ev {
+            self.handle_worktree_branch_out_finished(id, operation_id, branch, label, respond_to, results);
+            return;
+        }
+
         if let AppEvent::PaneDied { pane_id } = &ev {
             if self
                 .state
@@ -972,6 +977,14 @@ impl App {
                     request.id,
                     "invalid_request",
                     "worktree.create is handled asynchronously by the app runtime",
+                );
+            }
+            Method::WorktreeBranchOut(params) => {
+                let _ = params;
+                return responses::encode_error(
+                    request.id,
+                    "invalid_request",
+                    "worktree.branch_out is handled asynchronously by the app runtime",
                 );
             }
             Method::WorktreeOpen(params) => return self.handle_worktree_open(request.id, params),

@@ -348,11 +348,15 @@ fn workspace_list_entries_inner(app: &AppState, _force_expanded: bool) -> Vec<Wo
             });
 
         if let Some(parent_token) = parent_token_opt {
+            let clean_parent = parent_token.strip_prefix("Feature: ").unwrap_or(&parent_token).trim();
             for (other_idx, other) in app.workspaces.iter().enumerate() {
                 if other_idx != idx {
                     let other_display = other.display_name_from(&app.terminals, &crate::terminal::TerminalRuntimeRegistry::new());
-                    if other_display == parent_token ||
-                       other.custom_name.as_ref() == Some(&parent_token) ||
+                    let clean_other = other_display.strip_prefix("Feature: ").unwrap_or(&other_display).trim();
+                    let clean_custom = other.custom_name.as_ref().map(|s| s.strip_prefix("Feature: ").unwrap_or(s).trim());
+                    
+                    if clean_other == clean_parent ||
+                       clean_custom == Some(clean_parent) ||
                        other.id == parent_token {
                         parent_idx = Some(other_idx);
                         break;
@@ -1062,6 +1066,34 @@ fn apply_token_style(mut style: Style, patch: crate::config::SidebarTokenStyle) 
     style
 }
 
+fn workspace_has_children(app: &AppState, parent_idx: usize) -> bool {
+    let Some(parent_ws) = app.workspaces.get(parent_idx) else { return false; };
+    let parent_display = parent_ws.display_name_from(&app.terminals, &crate::terminal::TerminalRuntimeRegistry::new());
+    let clean_parent = parent_display.strip_prefix("Feature: ").unwrap_or(&parent_display).trim();
+    let clean_custom = parent_ws.custom_name.as_ref().map(|s| s.strip_prefix("Feature: ").unwrap_or(s).trim());
+
+    for (idx, ws) in app.workspaces.iter().enumerate() {
+        if idx == parent_idx { continue; }
+        let parent_token_opt = ws.metadata_tokens.values().get("PARENT_WORKSPACE").cloned()
+            .or_else(|| {
+                let parent_file = ws.identity_cwd.join(".parent");
+                if parent_file.exists() {
+                    std::fs::read_to_string(parent_file).ok().map(|content| format!("Feature: {}", content.trim()))
+                } else {
+                    None
+                }
+            });
+
+        if let Some(token) = parent_token_opt {
+            let clean_token = token.strip_prefix("Feature: ").unwrap_or(&token).trim();
+            if clean_token == clean_parent || clean_custom == Some(clean_token) || parent_ws.id == token {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn render_workspace_list(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
@@ -1177,11 +1209,13 @@ fn render_workspace_list(
             }
             let mut spans = Vec::new();
             if row_index == 0 {
+                let has_child_workspaces = workspace_has_children(app, i);
                 if card.indented {
-                    spans.push(Span::raw("   "));
-                } else if let Some((_, collapsed)) = parent_group.as_ref() {
+                    spans.push(Span::styled(" └─ ", Style::default().fg(p.overlay0)));
+                } else if has_child_workspaces || parent_group.is_some() {
+                    let collapsed = parent_group.as_ref().map_or(false, |(_, c)| *c);
                     spans.push(Span::styled(
-                        if *collapsed { "▸" } else { "▾" },
+                        if collapsed { "▸" } else { "▾" },
                         Style::default().fg(p.accent),
                     ));
                     spans.push(Span::raw(" "));

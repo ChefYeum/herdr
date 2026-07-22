@@ -3110,7 +3110,9 @@ impl HeadlessServer {
         self.sync_foreground_client_state();
         if matches!(
             &msg.request.method,
-            api::schema::Method::WorktreeCreate(_) | api::schema::Method::WorktreeRemove(_)
+            api::schema::Method::WorktreeCreate(_)
+                | api::schema::Method::WorktreeRemove(_)
+                | api::schema::Method::WorktreeBranchOut(_)
         ) {
             let deferred_changed = self
                 .app
